@@ -106,6 +106,7 @@ name = "distributed-key-value-store"
 version = "0.1.0"
 dependencies = [
  "raft",
+ "regex",
 ]
 
 [[package]]
