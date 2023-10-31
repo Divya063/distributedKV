@@ -107,6 +107,7 @@ version = "0.1.0"
 dependencies = [
  "raft",
  "regex",
+ "slog",
 ]
 
 [[package]]

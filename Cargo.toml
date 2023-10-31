@@ -8,3 +8,4 @@ edition = "2021"
 [dependencies]
 raft = "0.7.0"
 regex = "1.5.4"
+slog = "2.7.0"
