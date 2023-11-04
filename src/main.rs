@@ -30,22 +30,33 @@ enum Msg {
 }
 
 fn main() {
-
-    let mut leader_node = Node::create_leader_node();
+    let mut mailbox = HashMap::new();
+    let (sender_leader, receiver_leader) = mpsc::channel();
+    let (sender_follower, receiver_follower) = mpsc::channel();
+    mailbox.insert(1, sender_leader.clone());
+    mailbox.insert(2, sender_follower);
+    let mut leader_node = Node::create_leader_node(mailbox.clone(), receiver_leader);
+    let logger = leader_node.logger.clone();
     let node = Arc::new(Mutex::new(leader_node));
-    let sender = node.lock().unwrap().sender.clone();
 
     // to avoid blocking the main thread, we run the Raft in another thread.
-    let handler2 = thread::spawn(move || {raft_impl::start(node)});
+    let handler = thread::spawn(move || {raft_impl::start(node)});
     let key = "foo".to_owned();
     let value = "bar".to_owned();
-    put(sender, key, value);
-    
+    let mut follower_node = Node::create_follower_node(mailbox.clone(), receiver_follower, logger.clone());
 
+    raft_impl::add_followers(2, sender_leader.clone());
+    let follower_node = Arc::new(Mutex::new(follower_node));
+    println!("follower node created");
+    let follower_handler = thread::spawn(move || {raft_impl::start(follower_node)});
+    println!("follower node started");
+    // put is blocking
+    put(logger.clone(), sender_leader.clone(), key, value);
 
-    handler2.join().unwrap(); 
+    handler.join().unwrap(); 
+    follower_handler.join().unwrap();
 }
 
-fn put(sender: Sender<raft_impl::Msg> , key: String, value: String){
-    raft_impl::send_propose(sender, key, value);
+fn put(logger: Logger, sender: Sender<raft_impl::Msg> , key: String, value: String){
+    raft_impl::send_propose(logger, sender, key, value);
 }

@@ -1,31 +1,37 @@
+
+#![allow(clippy::field_reassign_with_default)]
+
 use raft::prelude::{RawNode,Config};
 use raft::storage::MemStorage;
-use raft::eraftpb::Snapshot;
+use raft::eraftpb::{Snapshot, EntryType, Message};
 use::std::collections::HashMap;
 use slog::{Drain, o, info};
 
 use std::thread;
 use std::time::{Duration, Instant};
 
-use raft::prelude::*;
+use raft::{prelude::*, StateRole};
 use slog_term;
 use slog_async;
-use std::sync::mpsc;
+use std::sync::mpsc::{self, Receiver};
 use std::sync::mpsc::RecvTimeoutError;
 use slog::Logger;
 use std::sync::{Arc, Mutex}; 
+use protobuf::Message as PbMessage;
+
 
 
 type ProposeCallback = Box<dyn Fn() + Send>;
 
 pub enum Msg {
     Propose {
-        id: u8,
+        // id: u8,
         data: Vec<u8>,
-        cb: ProposeCallback,
+        // cb: ProposeCallback,
     },
     #[allow(dead_code)]
     Raft(Message),
+    ConfChange(ConfChange),
 }
 
 
@@ -33,12 +39,13 @@ pub struct Node {
     pub node: RawNode<MemStorage>,
     pub logger: slog::Logger,
     pub key_value_store: HashMap<String, String>,
-    pub sender: mpsc::Sender<Msg>,
+    // mailbox to communicate with other nodes
+    pub mailbox: HashMap<u64, mpsc::Sender<Msg>>,
     pub receiver: mpsc::Receiver<Msg>,
 }
 
 impl Node {
-    pub fn create_leader_node()-> Self{
+    pub fn create_leader_node(mailbox: HashMap<u64, mpsc::Sender<Msg>>, receiver: Receiver<Msg>)-> Self{
         let config = Config {
             id: 1,
             ..Default::default()
@@ -60,7 +67,6 @@ impl Node {
         s.mut_metadata().mut_conf_state().voters = vec![1];
 
         storage.wl().apply_snapshot(s).unwrap();
-        let (sender, receiver) = mpsc::channel();
         let mut node = RawNode::new(&config, storage, &logger).unwrap();
         
         // mandatory to become a candidate first: invalid transition [follower -> leader]
@@ -69,28 +75,26 @@ impl Node {
          Node {
             node: node,
             logger: logger,
-            sender: sender,
             receiver: receiver,
+            mailbox: mailbox,
             key_value_store: HashMap::new(),
          }
 
     }
 
 
-    pub fn create_follower_node()-> Self{
+    pub fn create_follower_node(mailbox: HashMap<u64, mpsc::Sender<Msg>>, receiver: Receiver<Msg>, logger: slog::Logger)-> Self{
         let config = Config {
             id: 2,
             ..Default::default()
         };
-        let logger = raft::default_logger();
         let storage = MemStorage::new();
         let mut node = RawNode::new(&config, storage, &logger).unwrap();
-        let (sender, receiver) = mpsc::channel();
         Node {
             node: node,
             logger: logger,
-            sender: sender,
             receiver: receiver,
+            mailbox: mailbox,
             key_value_store: HashMap::new(),
         }
     }
@@ -110,10 +114,18 @@ pub fn start(node: Arc<Mutex<Node>>) {
         let mut t = Instant::now();
         let mut timeout = Duration::from_millis(100);
             match node.receiver.recv_timeout(timeout) {
-                Ok(Msg::Propose { id, data, cb }) => {
+                Ok(Msg::Propose { data }) => {
+                    if node.node.raft.state != StateRole::Leader {
+                        // Not leader, drop
+                        continue;
+                    }
                     print!(" receive data: {}", std::str::from_utf8(&data).unwrap());
-                    cbs.insert(id, cb);
+                    // cbs.insert(id, cb);
                     node.node.propose(vec![], data).unwrap();
+                }
+                Ok(Msg::ConfChange(cc)) => {
+                    print!(" receive conf change: {:?}", cc);
+                    let _ = node.node.apply_conf_change(&cc);
                 }
                 Ok(Msg::Raft(m)) => node.node.step(m).unwrap(),
                 Err(RecvTimeoutError::Timeout) => (),
@@ -144,15 +156,17 @@ fn on_ready(node: &mut Node,cbs: &mut HashMap<u8, ProposeCallback>) {
     // Get the `Ready` with `RawNode::ready` interface.
     let mut ready = node.node.ready();
 
-    let handle_messages = |msgs: Vec<Message>| {
-        for _msg in msgs {
-            // Send messages to other peers.
+    let handle_messages = |node: &mut Node, msgs: Vec<Message>| {
+        for msg in msgs {
+            let to = msg.to;
+            node.mailbox.get(&to).unwrap().send(Msg::Raft(msg)).unwrap();
+
         }
     };
 
     if !ready.messages().is_empty() {
         // Send out the messages come from the node.
-        handle_messages(ready.take_messages());
+        handle_messages(node, ready.take_messages());
     }
 
     if !ready.snapshot().is_empty() {
@@ -161,13 +175,21 @@ fn on_ready(node: &mut Node,cbs: &mut HashMap<u8, ProposeCallback>) {
     }
 
     let mut _last_apply_index = 0;
-    let mut handle_committed_entries = |committed_entries: Vec<Entry>| {
+    let mut handle_committed_entries = |node: &mut Node, committed_entries: Vec<Entry>| {
         info!(logger, "handle_committed_entries"; "committed_entries" => format!("{:?}", committed_entries));
         for entry in committed_entries {
 
             if entry.data.is_empty() {
                 // Empty entry, when the peer becomes Leader it will send an empty entry.
                 continue;
+            }
+            if let EntryType::EntryConfChange = entry.get_entry_type() {
+                // For conf change messages, make them effective.
+                let mut cc = ConfChange::default();
+                // TODO
+                cc.merge_from_bytes(&entry.data);
+                let cs = node.node.apply_conf_change(&cc).unwrap();
+                store.wl().set_conf_state(cs);
             }
 
             if entry.get_entry_type() == EntryType::EntryNormal {
@@ -177,16 +199,16 @@ fn on_ready(node: &mut Node,cbs: &mut HashMap<u8, ProposeCallback>) {
                 let value = temp_data[1].to_owned();
                 info!(logger, "key {} value {}", key, value);
                 node.key_value_store.insert(key, value);
-                info!(logger, "handle_committed_entries"; "data" => data);
-                if let Some(cb) = cbs.remove(entry.data.first().unwrap()) {
-                    cb();
-                }
+                info!(logger, "handle_committed_entries {} node id {}", data, node.node.raft.id);
+                // if let Some(cb) = cbs.remove(entry.data.first().unwrap()) {
+                //     cb();
+                // }
             }
 
             // TODO: handle EntryConfChange
         }
     };
-    handle_committed_entries(ready.take_committed_entries());
+    handle_committed_entries(node, ready.take_committed_entries());
 
     if !ready.entries().is_empty() {
         // Append entries to the Raft log.
@@ -200,7 +222,7 @@ fn on_ready(node: &mut Node,cbs: &mut HashMap<u8, ProposeCallback>) {
 
     if !ready.persisted_messages().is_empty() {
         // Send out the persisted messages come from the node.
-        handle_messages(ready.take_persisted_messages());
+        handle_messages(node, ready.take_persisted_messages());
     }
 
     // Advance the Raft.
@@ -210,35 +232,43 @@ fn on_ready(node: &mut Node,cbs: &mut HashMap<u8, ProposeCallback>) {
         store.wl().mut_hard_state().set_commit(commit);
     }
     // Send out the messages.
-    handle_messages(light_rd.take_messages());
+    handle_messages(node, light_rd.take_messages());
     // Apply all committed entries.
-    handle_committed_entries(light_rd.take_committed_entries());
+    handle_committed_entries(node, light_rd.take_committed_entries());
     // Advance the apply index.
     node.node.advance_apply();
 }
 
-pub fn send_propose(sender: mpsc::Sender<Msg>, key: String, value: String) {
-        let logger = raft::default_logger();
+pub fn send_propose(logger: slog::Logger , sender: mpsc::Sender<Msg>, key: String, value: String) {
 
-        let (s1, r1) = mpsc::channel::<u8>();
+        // let (s1, r1) = mpsc::channel::<u8>();
         let data = format!("{} {}", key, value).into_bytes();
 
         // Send a command to the Raft, wait for the Raft to apply it
         // and get the result.
+        info!(logger, "hello");
         sender
             .send(Msg::Propose {
-                id: 1,
                 data: data,
-                cb: Box::new(move || {
-                    s1.send(0).unwrap();
-                }),
-            })
+                })
             .unwrap();
-        let n = r1.recv().unwrap();
-        assert!(n == 1);
-        info!(logger, "receive the propose callback"; "n" => n);
-        if n == 0 {
-            info!(logger, "receive the propose callback");
-        }
+        println!("send_propose");
 }
 
+fn conf_change(t: ConfChangeType, node_id: u64) -> ConfChange {
+    let mut cc = ConfChange::default();
+    cc.set_change_type(t);
+    cc.node_id = node_id;
+    cc
+}
+
+pub fn add_followers(node_id: u64, sender: mpsc::Sender<Msg>) {
+    let cc = conf_change(ConfChangeType::AddNode, node_id);
+    sender.send(Msg::ConfChange((&cc).clone())).unwrap();
+
+}
+
+pub fn remove_followers(node_id: u64, sender: mpsc::Sender<Msg>) {
+    let cc = conf_change(ConfChangeType::RemoveNode, node_id);
+    sender.send(Msg::ConfChange((&cc).clone())).unwrap();
+}
