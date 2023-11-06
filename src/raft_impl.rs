@@ -7,7 +7,7 @@ use raft::eraftpb::{Snapshot, EntryType, Message};
 use::std::collections::HashMap;
 use slog::{Drain, o, info};
 
-use std::thread;
+use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
 use raft::{prelude::*, StateRole};
@@ -48,6 +48,7 @@ impl Node {
     pub fn create_leader_node(mailbox: HashMap<u64, mpsc::Sender<Msg>>, receiver: Receiver<Msg>)-> Self{
         let config = Config {
             id: 1,
+            heartbeat_tick: 3,
             ..Default::default()
         };
         let decorator = slog_term::TermDecorator::new().build();
@@ -112,20 +113,21 @@ pub fn start(node: Arc<Mutex<Node>>) {
          // Loop forever to drive the Raft.
         let mut node = cloned_node.lock().unwrap();
         let mut t = Instant::now();
-        let mut timeout = Duration::from_millis(100);
+        let mut timeout = Duration::from_millis(500);
             match node.receiver.recv_timeout(timeout) {
                 Ok(Msg::Propose { data }) => {
-                    if node.node.raft.state != StateRole::Leader {
-                        // Not leader, drop
+                    if node.node.raft.state == StateRole::Leader {
+                        // cbs.insert(id, cb);
+                        node.node.propose(vec![], data).unwrap();
+                    } else {
                         continue;
                     }
-                    print!(" receive data: {}", std::str::from_utf8(&data).unwrap());
-                    // cbs.insert(id, cb);
-                    node.node.propose(vec![], data).unwrap();
                 }
                 Ok(Msg::ConfChange(cc)) => {
-                    print!(" receive conf change: {:?}", cc);
-                    let _ = node.node.apply_conf_change(&cc);
+                    let cs = node.node.apply_conf_change(&cc).unwrap();
+                    let store = node.node.raft.raft_log.store.clone();
+                    // set the conf state to restore the snapshot, this will avoid the error - attempted to restore snapshot but it is not in the ConfState
+                    store.wl().set_conf_state(cs);
                 }
                 Ok(Msg::Raft(m)) => node.node.step(m).unwrap(),
                 Err(RecvTimeoutError::Timeout) => (),
@@ -193,6 +195,7 @@ fn on_ready(node: &mut Node,cbs: &mut HashMap<u8, ProposeCallback>) {
             }
 
             if entry.get_entry_type() == EntryType::EntryNormal {
+                print!("entry data: {:?}", entry.data);
                 let data = std::str::from_utf8(&entry.data).unwrap();
                 let temp_data: Vec<&str> = data.split(" ").collect();
                 let key = temp_data[0].to_owned();
@@ -204,8 +207,6 @@ fn on_ready(node: &mut Node,cbs: &mut HashMap<u8, ProposeCallback>) {
                 //     cb();
                 // }
             }
-
-            // TODO: handle EntryConfChange
         }
     };
     handle_committed_entries(node, ready.take_committed_entries());
@@ -214,6 +215,7 @@ fn on_ready(node: &mut Node,cbs: &mut HashMap<u8, ProposeCallback>) {
         // Append entries to the Raft log.
         store.wl().append(ready.entries()).unwrap();
     }
+
 
     if let Some(hs) = ready.hs() {
         // Raft HardState changed, and we need to persist it.
@@ -240,7 +242,7 @@ fn on_ready(node: &mut Node,cbs: &mut HashMap<u8, ProposeCallback>) {
 }
 
 pub fn send_propose(logger: slog::Logger , sender: mpsc::Sender<Msg>, key: String, value: String) {
-
+    thread::spawn( move || {   
         // let (s1, r1) = mpsc::channel::<u8>();
         let data = format!("{} {}", key, value).into_bytes();
 
@@ -253,6 +255,11 @@ pub fn send_propose(logger: slog::Logger , sender: mpsc::Sender<Msg>, key: Strin
                 })
             .unwrap();
         println!("send_propose");
+
+
+
+    });
+    
 }
 
 fn conf_change(t: ConfChangeType, node_id: u64) -> ConfChange {
