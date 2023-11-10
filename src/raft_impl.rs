@@ -3,8 +3,9 @@
 
 use raft::prelude::{RawNode,Config};
 use raft::storage::MemStorage;
-use raft::eraftpb::{Snapshot, EntryType, Message};
+use raft::eraftpb::{Snapshot, EntryType, Message, self};
 use::std::collections::HashMap;
+use std::collections::VecDeque;
 use slog::{Drain, o, info};
 
 use std::thread::{self, Thread};
@@ -13,20 +14,15 @@ use std::time::{Duration, Instant};
 use raft::{prelude::*, StateRole};
 use slog_term;
 use slog_async;
-use std::sync::mpsc::{self, Receiver};
-use std::sync::mpsc::RecvTimeoutError;
-use slog::Logger;
+use std::sync::mpsc::{self, Receiver, SendError};
 use std::sync::{Arc, Mutex}; 
 use protobuf::Message as PbMessage;
-
-
-
-type ProposeCallback = Box<dyn Fn() + Send>;
+use std::sync::mpsc::SyncSender;
 
 pub enum Msg {
     Propose {
-        // id: u8,
         data: Vec<u8>,
+        propose_success: SyncSender<bool>,
         // cb: ProposeCallback,
     },
     #[allow(dead_code)]
@@ -35,17 +31,18 @@ pub enum Msg {
 }
 
 
+
 pub struct Node {
     pub node: RawNode<MemStorage>,
     pub logger: slog::Logger,
-    pub key_value_store: HashMap<String, String>,
+    pub key_value_store: Arc<Mutex<HashMap<String, String>>>,
     // mailbox to communicate with other nodes
-    pub mailbox: HashMap<u64, mpsc::Sender<Msg>>,
+    pub mailbox: Arc<Mutex<HashMap<u64, mpsc::Sender<Msg>>>>,
     pub receiver: mpsc::Receiver<Msg>,
 }
 
 impl Node {
-    pub fn create_leader_node(mailbox: HashMap<u64, mpsc::Sender<Msg>>, receiver: Receiver<Msg>)-> Self{
+    pub fn create_leader_node(mailbox: &Arc<Mutex<HashMap<u64, mpsc::Sender<Msg>>>>, receiver: Receiver<Msg>, kv_store: Arc<Mutex<HashMap<String, String>>>)-> Self{
         let config = Config {
             id: 1,
             heartbeat_tick: 3,
@@ -69,7 +66,7 @@ impl Node {
 
         storage.wl().apply_snapshot(s).unwrap();
         let mut node = RawNode::new(&config, storage, &logger).unwrap();
-        
+
         // mandatory to become a candidate first: invalid transition [follower -> leader]
         node.raft.become_candidate();
         node.raft.become_leader();
@@ -77,16 +74,16 @@ impl Node {
             node: node,
             logger: logger,
             receiver: receiver,
-            mailbox: mailbox,
-            key_value_store: HashMap::new(),
+            mailbox: Arc::clone(mailbox),
+            key_value_store: Arc::clone(&kv_store),
          }
 
     }
 
 
-    pub fn create_follower_node(mailbox: HashMap<u64, mpsc::Sender<Msg>>, receiver: Receiver<Msg>, logger: slog::Logger)-> Self{
+    pub fn create_follower_node(id: u64, mailbox: Arc<Mutex<HashMap<u64, mpsc::Sender<Msg>>>>, receiver: Receiver<Msg>, logger: slog::Logger)-> Self{
         let config = Config {
-            id: 2,
+            id: id,
             ..Default::default()
         };
         let storage = MemStorage::new();
@@ -95,29 +92,25 @@ impl Node {
             node: node,
             logger: logger,
             receiver: receiver,
-            mailbox: mailbox,
-            key_value_store: HashMap::new(),
+            mailbox: Arc::clone(&mailbox),
+            key_value_store: Arc::new(Mutex::new(HashMap::new())),
         }
-    }
-
-    pub fn get_value(&self, key: &str) -> Option<String> {
-        self.key_value_store.get(key).cloned()
     }
    
 }
 
-pub fn start(node: Arc<Mutex<Node>>) {
-    let mut cbs = HashMap::new();
+pub async fn start(node: Arc<Mutex<Node>>) {
+    let mut cbs = VecDeque::new();
     let cloned_node = Arc::clone(&node);
     loop {
          // Loop forever to drive the Raft.
         let mut node = cloned_node.lock().unwrap();
         let mut t = Instant::now();
         let mut timeout = Duration::from_millis(500);
-            match node.receiver.recv_timeout(timeout) {
-                Ok(Msg::Propose { data }) => {
+            match node.receiver.recv() {
+                Ok(Msg::Propose { data , propose_success}) => {
                     if node.node.raft.state == StateRole::Leader {
-                        // cbs.insert(id, cb);
+                        cbs.push_back(propose_success);
                         node.node.propose(vec![], data).unwrap();
                     } else {
                         continue;
@@ -128,10 +121,12 @@ pub fn start(node: Arc<Mutex<Node>>) {
                     let store = node.node.raft.raft_log.store.clone();
                     // set the conf state to restore the snapshot, this will avoid the error - attempted to restore snapshot but it is not in the ConfState
                     store.wl().set_conf_state(cs);
+
                 }
                 Ok(Msg::Raft(m)) => node.node.step(m).unwrap(),
-                Err(RecvTimeoutError::Timeout) => (),
-                Err(RecvTimeoutError::Disconnected) => return,
+                Err(receive_error) => {
+                    slog::error!(node.logger, "Receive error {}", receive_error);
+                },
             }
     
             let d = t.elapsed();
@@ -148,7 +143,7 @@ pub fn start(node: Arc<Mutex<Node>>) {
  
 }
 
-fn on_ready(node: &mut Node,cbs: &mut HashMap<u8, ProposeCallback>) {
+fn on_ready(node: &mut Node,cbs: &mut VecDeque<SyncSender<bool>>) {
     let logger = node.logger.clone();
     if !node.node.has_ready() {
         return;
@@ -161,8 +156,15 @@ fn on_ready(node: &mut Node,cbs: &mut HashMap<u8, ProposeCallback>) {
     let handle_messages = |node: &mut Node, msgs: Vec<Message>| {
         for msg in msgs {
             let to = msg.to;
-            node.mailbox.get(&to).unwrap().send(Msg::Raft(msg)).unwrap();
-
+            print!(" msg type {:?}", msg.get_msg_type());
+            let result = node.mailbox.lock().unwrap().get(&to).unwrap().send(Msg::Raft(msg));
+            match result {
+                Ok(_) => {info!(logger, "sent message to {}", to);
+            }
+                Err(err) => {
+                    info!(logger, "failed to send message {}", err);
+                },
+            }
         }
     };
 
@@ -180,7 +182,6 @@ fn on_ready(node: &mut Node,cbs: &mut HashMap<u8, ProposeCallback>) {
     let mut handle_committed_entries = |node: &mut Node, committed_entries: Vec<Entry>| {
         info!(logger, "handle_committed_entries"; "committed_entries" => format!("{:?}", committed_entries));
         for entry in committed_entries {
-
             if entry.data.is_empty() {
                 // Empty entry, when the peer becomes Leader it will send an empty entry.
                 continue;
@@ -195,18 +196,25 @@ fn on_ready(node: &mut Node,cbs: &mut HashMap<u8, ProposeCallback>) {
             }
 
             if entry.get_entry_type() == EntryType::EntryNormal {
+                print!("node state {:?}", node.node.raft.state);
                 print!("entry data: {:?}", entry.data);
                 let data = std::str::from_utf8(&entry.data).unwrap();
                 let temp_data: Vec<&str> = data.split(" ").collect();
                 let key = temp_data[0].to_owned();
                 let value = temp_data[1].to_owned();
                 info!(logger, "key {} value {}", key, value);
-                node.key_value_store.insert(key, value);
+                node.key_value_store.lock().unwrap().insert(key, value);
+                 // we need acknowledggement just from the leader
+                if node.node.raft.state == StateRole::Leader {
+                    // The leader should response to the clients, tell them if their proposals
+                    // succeeded or not.
+                    let propose_success = cbs.pop_front().unwrap();
+                    propose_success.send(true).unwrap();
+            
+                }
                 info!(logger, "handle_committed_entries {} node id {}", data, node.node.raft.id);
-                // if let Some(cb) = cbs.remove(entry.data.first().unwrap()) {
-                //     cb();
-                // }
             }
+
         }
     };
     handle_committed_entries(node, ready.take_committed_entries());
@@ -241,25 +249,29 @@ fn on_ready(node: &mut Node,cbs: &mut HashMap<u8, ProposeCallback>) {
     node.node.advance_apply();
 }
 
-pub fn send_propose(logger: slog::Logger , sender: mpsc::Sender<Msg>, key: String, value: String) {
-    thread::spawn( move || {   
-        // let (s1, r1) = mpsc::channel::<u8>();
+pub async fn send_propose(logger: slog::Logger , sender: mpsc::Sender<Msg>, key: String, value: String) ->bool {  
+        let (tx, rx) = mpsc::sync_channel(1);
         let data = format!("{} {}", key, value).into_bytes();
 
         // Send a command to the Raft, wait for the Raft to apply it
         // and get the result.
-        info!(logger, "hello");
-        sender
+        let result = sender
             .send(Msg::Propose {
                 data: data,
-                })
-            .unwrap();
-        println!("send_propose");
+                propose_success: tx,
+                });
+        match result {
+            Ok(_) => (),
+            Err(err) => {
+                slog::error!(logger, "failed to send proposal {}", err);
+                return false;
+            },
+        }
+        // add timeout for the wait
 
-
-
-    });
-    
+        let received = rx.recv().unwrap();
+        info!(logger, "received from channel {}", received);
+        return received; 
 }
 
 fn conf_change(t: ConfChangeType, node_id: u64) -> ConfChange {
@@ -271,6 +283,7 @@ fn conf_change(t: ConfChangeType, node_id: u64) -> ConfChange {
 
 pub fn add_followers(node_id: u64, sender: mpsc::Sender<Msg>) {
     let cc = conf_change(ConfChangeType::AddNode, node_id);
+    // send to leader node
     sender.send(Msg::ConfChange((&cc).clone())).unwrap();
 
 }
