@@ -20,7 +20,7 @@ pub struct ValRequest{
 }
 
 #[derive(Deserialize, Serialize)]
-pub struct JoinRequest{
+pub struct NodeRequest{
     id: u64,
 }
 
@@ -34,6 +34,7 @@ struct KeyValueState {
     mailbox: Arc<Mutex<HashMap<u64, Sender<Msg>>>>,
     key_value_store: Arc<Mutex<HashMap<String, String>>>,
     logger: Logger,
+    sender: Sender<Msg>,
 
 }
 
@@ -67,11 +68,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             mailbox: Arc::clone(&mailbox),
             key_value_store: Arc::clone(&kv_store),
             logger: logger.clone(),
+            sender: sender_leader.clone(),
         })
         )
             .route("/get", web::get().to(get_value))
             .route("/put", web::post().to(insert))
             .route("/join", web::get().to(join))
+            .route("/leave", web::get().to(leave))
     })
     .bind("127.0.0.1:9023")?
     .run();
@@ -82,10 +85,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 
 async fn insert(data: web::Data<KeyValueState>, req_body: web::Json<PayLoad>) -> impl Responder {
-    let mailbox = &*data.mailbox.lock().unwrap();
-    let sender = mailbox.get(&1).unwrap().clone();
+    let sender = data.sender.clone();
     let logger = data.logger.clone();
-    // parse the request body
     let key = req_body.key.clone();
     let val = req_body.value.clone();
     raft_impl::send_propose(logger, sender, key, val).await;
@@ -114,13 +115,15 @@ async fn get_value(data: web::Data<KeyValueState>, query: web::Query<ValRequest>
     };
 }
 
-async fn join(data: web::Data<KeyValueState>, query: web::Query<JoinRequest>) -> impl Responder {
+async fn join(data: web::Data<KeyValueState>, query: web::Query<NodeRequest>) -> impl Responder {
     let id = query.id.clone();
-    let mailbox = &mut data.mailbox.lock().unwrap();
+    let mailbox = &mut data.mailbox.try_lock().unwrap();
     if mailbox.contains_key(&id) {
         return HttpResponse::BadRequest().body("Node already exists");
     }
     let logger = data.logger.clone();
+
+    // use the leader node to send the join request
     let sender = mailbox.get(&1).unwrap().clone();
 
     let (sender_follower, receiver_follower) = mpsc::channel();
@@ -129,6 +132,20 @@ async fn join(data: web::Data<KeyValueState>, query: web::Query<JoinRequest>) ->
     let follower_node = Node::create_follower_node(id, Arc::clone(&data.mailbox), receiver_follower, logger);
     let follower_node = Arc::new(Mutex::new(follower_node));
     let _follower_handler = tokio::spawn(raft_impl::start(follower_node));
+    log::debug!("follower node created");
     raft_impl::add_followers(id, sender);
     HttpResponse::Ok().finish()
 }
+
+async fn leave(data: web::Data<KeyValueState>, query: web::Query<NodeRequest>) -> impl Responder {
+    let id = query.id.clone();
+    let mailbox = &mut data.mailbox.try_lock().unwrap();
+    if !mailbox.contains_key(&id) {
+        return HttpResponse::BadRequest().body("Node does not exist");
+    }
+    
+    raft_impl::remove_follower(id, data.sender.clone());
+    HttpResponse::Ok().finish()
+}
+
+

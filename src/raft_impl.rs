@@ -1,6 +1,7 @@
 
 #![allow(clippy::field_reassign_with_default)]
 
+use log::logger;
 use raft::prelude::{RawNode,Config};
 use raft::storage::MemStorage;
 use raft::eraftpb::{Snapshot, EntryType, Message, self};
@@ -110,6 +111,7 @@ pub async fn start(node: Arc<Mutex<Node>>) {
             match node.receiver.recv() {
                 Ok(Msg::Propose { data , propose_success}) => {
                     if node.node.raft.state == StateRole::Leader {
+                        log::debug!("received message");
                         cbs.push_back(propose_success);
                         node.node.propose(vec![], data).unwrap();
                     } else {
@@ -121,11 +123,16 @@ pub async fn start(node: Arc<Mutex<Node>>) {
                     let store = node.node.raft.raft_log.store.clone();
                     // set the conf state to restore the snapshot, this will avoid the error - attempted to restore snapshot but it is not in the ConfState
                     store.wl().set_conf_state(cs);
+                    if cc.get_change_type() == ConfChangeType::RemoveNode {
+                        log::info!("remove node {}", cc.node_id);
+                        node.mailbox.lock().unwrap().remove(&cc.node_id);
+                    }
 
                 }
                 Ok(Msg::Raft(m)) => node.node.step(m).unwrap(),
                 Err(receive_error) => {
                     slog::error!(node.logger, "Receive error {}", receive_error);
+                    break;
                 },
             }
     
@@ -157,7 +164,7 @@ fn on_ready(node: &mut Node,cbs: &mut VecDeque<SyncSender<bool>>) {
         for msg in msgs {
             let to = msg.to;
             print!(" msg type {:?}", msg.get_msg_type());
-            let result = node.mailbox.lock().unwrap().get(&to).unwrap().send(Msg::Raft(msg));
+            let result = node.mailbox.try_lock().unwrap().get(&to).unwrap().send(Msg::Raft(msg));
             match result {
                 Ok(_) => {info!(logger, "sent message to {}", to);
             }
@@ -196,8 +203,6 @@ fn on_ready(node: &mut Node,cbs: &mut VecDeque<SyncSender<bool>>) {
             }
 
             if entry.get_entry_type() == EntryType::EntryNormal {
-                print!("node state {:?}", node.node.raft.state);
-                print!("entry data: {:?}", entry.data);
                 let data = std::str::from_utf8(&entry.data).unwrap();
                 let temp_data: Vec<&str> = data.split(" ").collect();
                 let key = temp_data[0].to_owned();
@@ -252,7 +257,6 @@ fn on_ready(node: &mut Node,cbs: &mut VecDeque<SyncSender<bool>>) {
 pub async fn send_propose(logger: slog::Logger , sender: mpsc::Sender<Msg>, key: String, value: String) ->bool {  
         let (tx, rx) = mpsc::sync_channel(1);
         let data = format!("{} {}", key, value).into_bytes();
-
         // Send a command to the Raft, wait for the Raft to apply it
         // and get the result.
         let result = sender
@@ -284,11 +288,12 @@ fn conf_change(t: ConfChangeType, node_id: u64) -> ConfChange {
 pub fn add_followers(node_id: u64, sender: mpsc::Sender<Msg>) {
     let cc = conf_change(ConfChangeType::AddNode, node_id);
     // send to leader node
+    log::debug!("sending conf change to leader node");
     sender.send(Msg::ConfChange((&cc).clone())).unwrap();
 
 }
 
-pub fn remove_followers(node_id: u64, sender: mpsc::Sender<Msg>) {
+pub fn remove_follower(node_id: u64, sender: mpsc::Sender<Msg>) {
     let cc = conf_change(ConfChangeType::RemoveNode, node_id);
     sender.send(Msg::ConfChange((&cc).clone())).unwrap();
 }
